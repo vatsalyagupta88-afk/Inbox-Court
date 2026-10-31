@@ -1,396 +1,515 @@
 // src/engine.js
-// Pure logic for Inbox Court. No DOM, no I/O. Importable by Node for tests.
+// Pure game/chore engine. No DOM. No network. No dependencies.
 
-import { parseExpense, isNearDuplicate, FREEMAIL_DOMAINS } from './mock.js';
+export const CLEARED_LABEL = 'InboxCourt/Cleared';
+export const REVIEW_LABEL = 'InboxCourt/Review';
 
-const FREEMAIL = new Set(FREEMAIL_DOMAINS);
-
-/**
- * Group messages into sender cards.
- * Key: (domain, hasListUnsubscribe) — EXCEPT freemail domains, which are
- * keyed by full address so gmail.com does not collapse into one card.
- * Expense messages are excluded (Docket-only).
- */
-export function groupIntoSenderCards(messages) {
-  const cards = new Map();
-  for (const msg of messages) {
-    if (!msg.labels.includes('INBOX')) continue;
-    if (msg.isExpense) continue;
-    const key = FREEMAIL.has(msg.senderDomain)
-      ? `${msg.from.toLowerCase()}|${msg.hasListUnsubscribe}`
-      : `${msg.senderDomain}|${msg.hasListUnsubscribe}`;
-    if (!cards.has(key)) {
-      cards.set(key, {
-        key,
-        domain: msg.senderDomain,
-        from: msg.from,
-        hasListUnsubscribe: msg.hasListUnsubscribe,
-        messages: []
-      });
-    }
-    cards.get(key).messages.push(msg);
-  }
-
-  const result = [];
-  for (const card of cards.values()) {
-    const msgs = card.messages;
-    const total = msgs.length;
-    const unread = msgs.filter(m => m.isUnread).length;
-    const dates = msgs.map(m => m.dateEpoch).sort((a, b) => a - b);
-    const subjects = [...new Set(msgs.map(m => m.subject))].slice(0, 3);
-    const localPart = card.from.split('@')[0].toLowerCase();
-    const isGenericLocal = ['noreply', 'no-reply', 'newsletter', 'updates', 'billing', 'support', 'team', 'notifications', 'hello'].includes(localPart);
-    result.push({
-      key: card.key,
-      domain: card.domain,
-      from: card.from,
-      hasListUnsubscribe: card.hasListUnsubscribe,
-      name: isGenericLocal ? card.domain : localPart,
-      count: total,
-      ignoredRatio: total ? unread / total : 0,
-      subjects,
-      oldest: new Date(dates[0]).toISOString(),
-      newest: new Date(dates[dates.length - 1]).toISOString(),
-      messages: msgs,
-      messageIds: msgs.map(m => m.id)
-    });
-  }
-  result.sort((a, b) => b.count - a.count);
-  return result;
-}
-
-// Protection subject words — whole-word where safe, structural patterns for "order".
-const PROTECTION_RX = [
-  /\breceipt\b/i,
-  /\binvoice\b/i,
-  /\botp\b/i,
-  /\bbank\b/i,
-  /\bstatement\b/i,
-  /\bpassword\b/i,
-  /\border\s*#/i,
-  /\border\s+confirmed\b/i,
-  /\byour\s+order\b/i
+const SAFETY_WORDS = [
+  'security code',
+  'verification code',
+  'two-factor',
+  '2fa',
+  'password',
+  'login attempt',
+  'account alert',
+  'sign-in attempt',
+  'personal message',
+  'doctor',
+  'legal',
+  'contract'
 ];
 
-/**
- * Protection signals (any single one → protected):
- *   starred, important, address in sent contacts,
- *   personal-looking freemail sender, sender domain matches a sent
- *   contact's non-freemail domain, or a protection subject word
- *   (receipt/invoice/OTP/bank/statement/password; "order" only as
- *   "order #", "order confirmed", "your order").
- * A signal matches if ANY single message in the card matches.
- */
-export function checkProtectionSignals(card, sentContacts, contactDomains) {
-  if (card.messages.some(m => m.isStarred)) return true;
-  if (card.messages.some(m => m.isImportant)) return true;
-  if (card.messages.some(m => sentContacts.has(m.from.toLowerCase()))) return true;
+const GENERIC_LOCALS = new Set([
+  'noreply',
+  'no-reply',
+  'newsletter',
+  'updates',
+  'billing',
+  'support',
+  'team',
+  'notifications',
+  'hello',
+  'mailer-daemon'
+]);
 
-  if (FREEMAIL.has(card.domain) && card.count < 20 && card.ignoredRatio < 0.5) return true;
+const KNOWN_SYSTEM_LABELS = new Set([
+  'INBOX',
+  'STARRED',
+  'IMPORTANT',
+  'UNREAD',
+  'SENT',
+  'DRAFT',
+  'SPAM',
+  'TRASH',
+  'CATEGORY_PERSONAL',
+  'CATEGORY_PROMOTIONS',
+  'CATEGORY_SOCIAL',
+  'CATEGORY_UPDATES',
+  'CATEGORY_FORUMS'
+]);
 
-  if (contactDomains.has(card.domain) && !FREEMAIL.has(card.domain)) return true;
+function normalizeEmail(email) {
+  return String(email || '').toLowerCase().trim();
+}
 
-  for (const m of card.messages) {
-    const text = `${m.subject} ${m.snippet}`;
-    if (PROTECTION_RX.some(rx => rx.test(text))) return true;
+function emailDomain(email) {
+  const at = normalizeEmail(email).indexOf('@');
+  return at === -1 ? '' : normalizeEmail(email).slice(at + 1);
+}
+
+function localPart(email) {
+  const normalized = normalizeEmail(email);
+  const at = normalized.indexOf('@');
+  return at === -1 ? normalized : normalized.slice(0, at);
+}
+
+function unique(values) {
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+function chunk(array, size) {
+  const out = [];
+  for (let i = 0; i < array.length; i += size) {
+    out.push(array.slice(i, i + size));
   }
-  return false;
+  return out;
 }
 
-/**
- * Junk requires BOTH a junk signal AND ignoredRatio >= 0.9:
- *   signals = List-Unsubscribe header, promotions/social category, noreply sender,
- *   never opened (ignoredRatio >= 0.9 counts as the never-opened signal itself).
- */
-export function checkJunkSignals(card) {
-  const isNoReply = card.from.toLowerCase().startsWith('noreply@') ||
-    card.from.toLowerCase().startsWith('no-reply@');
-  const isPromoOrSocial = card.messages.some(m =>
-    m.labels.includes('CATEGORY_PROMOTIONS') || m.labels.includes('CATEGORY_SOCIAL'));
-  const hasListUnsub = card.hasListUnsubscribe;
-  const hasSignal = hasListUnsub || isPromoOrSocial || isNoReply || card.ignoredRatio >= 0.9;
-  return hasSignal && card.ignoredRatio >= 0.9;
+function escapeCsv(value) {
+  const s = String(value ?? '');
+  if (/[",\n\r]/.test(s)) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
 }
 
-/**
- * Tier with strict precedence: protected > junk > ambiguous.
- * A card with no protection and no junk signal is ambiguous (never undefined).
- */
-export function scoreCard(card, sentContacts, contactDomains) {
-  if (checkProtectionSignals(card, sentContacts, contactDomains)) return 'protected';
-  if (checkJunkSignals(card)) return 'junk';
+function formatDateRange(messages) {
+  const dates = messages
+    .map(m => m.date)
+    .filter(Boolean)
+    .map(d => {
+      const parsed = new Date(d);
+      return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+    })
+    .filter(Boolean)
+    .sort();
+
+  if (!dates.length) return '—';
+  const min = dates[0].slice(0, 10);
+  const max = dates[dates.length - 1].slice(0, 10);
+  return min === max ? min : `${min} → ${max}`;
+}
+
+export function groupIntoSenderCards(messages) {
+  const byKey = new Map();
+
+  for (const msg of messages) {
+    const email = normalizeEmail(msg.email || msg.name || 'unknown');
+    const key = email || String(msg.name || 'Unknown');
+    if (!byKey.has(key)) {
+      byKey.set(key, {
+        key,
+        name: msg.name || email.split('@')[0] || 'Unknown',
+        email,
+        messages: [],
+        subjects: [],
+        count: 0,
+        ignoredCount: 0,
+        hasListUnsubscribe: false,
+        hasPromo: false,
+        hasNoreply: false,
+        hasProtectionSignal: false
+      });
+    }
+
+    const card = byKey.get(key);
+    card.messages.push(msg);
+    card.count += 1;
+
+    if (msg.ignored || !msg.labels.includes('INBOX')) {
+      card.ignoredCount += 1;
+    }
+
+    if (msg.listUnsubscribe) card.hasListUnsubscribe = true;
+    if (
+      msg.labels.includes('CATEGORY_PROMOTIONS') ||
+      msg.labels.includes('CATEGORY_SOCIAL') ||
+      msg.category === 'promotions' ||
+      msg.category === 'social'
+    ) {
+      card.hasPromo = true;
+    }
+
+    const local = localPart(msg.email || '');
+    if (GENERIC_LOCALS.has(local) || normalizeEmail(msg.email || '').includes('noreply')) {
+      card.hasNoreply = true;
+    }
+
+    if (
+      msg.starred ||
+      msg.important ||
+      msg.labels.includes('STARRED') ||
+      msg.labels.includes('IMPORTANT') ||
+      msg.personal
+    ) {
+      card.hasProtectionSignal = true;
+    }
+
+    if (card.subjects.length < 8 && msg.subject) {
+      card.subjects.push(msg.subject);
+    }
+  }
+
+  const cards = Array.from(byKey.values()).map(card => {
+    const subjectCounts = new Map();
+    for (const s of card.subjects) {
+      subjectCounts.set(s, (subjectCounts.get(s) || 0) + 1);
+    }
+
+    const topSubjects = Array.from(subjectCounts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .map(([s]) => s)
+      .slice(0, 3);
+
+    const nameCounts = new Map();
+    for (const m of card.messages) {
+      const n = m.name || card.email;
+      nameCounts.set(n, (nameCounts.get(n) || 0) + 1);
+    }
+
+    const bestName = Array.from(nameCounts.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] || card.email;
+
+    return {
+      ...card,
+      name: bestName,
+      subjects: topSubjects,
+      ignoredRatio: card.count ? card.ignoredCount / card.count : 0,
+      junkSignal: card.hasListUnsubscribe || card.hasPromo || card.hasNoreply
+    };
+  });
+
+  cards.sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+  return cards;
+}
+
+export function scoreCard(card, sentContacts = new Set(), contactDomains = new Set()) {
+  const emails = card.messages.map(m => normalizeEmail(m.email || ''));
+  const domains = emails.map(emailDomain);
+
+  const protectedByLabel = card.messages.some(m =>
+    m.starred ||
+    m.important ||
+    m.labels.includes('STARRED') ||
+    m.labels.includes('IMPORTANT')
+  );
+
+  const protectedByContact = emails.some(e => sentContacts.has(e));
+  const protectedByDomain = domains.some(d => contactDomains.has(d));
+  const protectedBySubject = card.messages.some(m => {
+    const subject = String(m.subject || '').toLowerCase();
+    return SAFETY_WORDS.some(word => subject.includes(word));
+  });
+
+  if (protectedByLabel || protectedByContact || protectedByDomain || protectedBySubject) {
+    return 'protected';
+  }
+
+  if (card.junkSignal && card.ignoredRatio >= 0.9) {
+    return 'junk';
+  }
+
   return 'ambiguous';
 }
 
-const CLEARED_LABEL = 'InboxCourt/Cleared';
-
-/**
- * Court verdicts → action queue items.
- * Exile = archive all + label InboxCourt/Cleared + create skip-inbox filter.
- * Archive = archive + label only. Parole = no action.
- * Expenses are never touched here.
- */
 export function applyCourtVerdict(cards, verdicts) {
   const actions = [];
+
   for (const card of cards) {
     const verdict = verdicts[card.key];
     if (!verdict) continue;
-    if (card.messages.some(m => m.isExpense)) continue; // guard: never touch expenses
-    const ids = card.messageIds;
-    if (verdict === 'Exile') {
-      actions.push({ type: 'batchModify', ids, addLabelIds: [CLEARED_LABEL], removeLabelIds: ['INBOX'] });
-      actions.push({
-        type: 'createFilter',
-        criteria: { from: card.hasListUnsubscribe ? `*@${card.domain}` : card.from },
-        action: { addLabelIds: [CLEARED_LABEL], removeLabelIds: ['INBOX'] }
-      });
-    } else if (verdict === 'Archive') {
-      actions.push({ type: 'batchModify', ids, addLabelIds: [CLEARED_LABEL], removeLabelIds: ['INBOX'] });
+
+    // Hard safety rail: protected mail never reaches backend mutation actions.
+    if (card.tier === 'protected' && verdict !== 'Parole') {
+      continue;
     }
-    // Parole: no action
+
+    const ids = card.messages.map(m => m.id).filter(Boolean);
+    if (!ids.length) continue;
+
+    if (verdict === 'Archive') {
+      actions.push({
+        kind: 'batchModify',
+        ids,
+        addLabels: [CLEARED_LABEL],
+        removeLabels: ['INBOX']
+      });
+    } else if (verdict === 'Exile') {
+      actions.push({
+        kind: 'batchModify',
+        ids,
+        addLabels: [CLEARED_LABEL],
+        removeLabels: ['INBOX']
+      });
+
+      actions.push({
+        kind: 'createFilter',
+        filter: {
+          from: card.email || card.name,
+          addLabels: [CLEARED_LABEL],
+          removeLabels: ['INBOX']
+        }
+      });
+    }
+    // Parole intentionally creates no action.
   }
+
   return actions;
 }
 
-/**
- * Docket verdicts → action queue items.
- * Approve = label InboxCourt/Expense/<Category> + archive.
- * Review = label only, stays in inbox.
- * No Exile verdict, no filter creation — ever.
- */
+export function expenseLabelForCategory(category) {
+  const safe = String(category || 'other')
+    .toLowerCase()
+    .replace(/[^a-z0-9-_ ]/g, '')
+    .trim()
+    .replace(/\s+/g, '-') || 'other';
+  return `InboxCourt/Expense/${safe}`;
+}
+
 export function applyDocketVerdict(cards, verdicts) {
   const actions = [];
+
   for (const card of cards) {
     const verdict = verdicts[card.key];
     if (!verdict) continue;
-    if (!['Approve', 'Review'].includes(verdict)) continue; // no Exile for expenses
-    const label = `InboxCourt/Expense/${cap(card.category || 'other')}`;
+
+    // Expense cards can never be Exiled and can never create filters.
+    if (verdict !== 'Approve' && verdict !== 'Review') {
+      continue;
+    }
+
+    const ids = card.messages.map(m => m.id).filter(Boolean);
+    if (!ids.length) continue;
+
     if (verdict === 'Approve') {
-      actions.push({ type: 'batchModify', ids: card.messageIds, addLabelIds: [label], removeLabelIds: ['INBOX'] });
-    } else {
-      actions.push({ type: 'batchModify', ids: card.messageIds, addLabelIds: [label], removeLabelIds: [] });
+      actions.push({
+        kind: 'batchModify',
+        ids,
+        addLabels: [CLEARED_LABEL, expenseLabelForCategory(card.category)],
+        removeLabels: ['INBOX']
+      });
+    } else if (verdict === 'Review') {
+      actions.push({
+        kind: 'batchModify',
+        ids,
+        addLabels: [REVIEW_LABEL],
+        removeLabels: []
+      });
     }
   }
+
   return actions;
 }
 
-function cap(s) {
-  return s.charAt(0).toUpperCase() + s.slice(1);
+export async function flushActions(client, actions, undoLog = []) {
+  for (const action of actions) {
+    if (action.kind === 'batchModify') {
+      const chunks = chunk(action.ids, 1000);
+
+      for (const ids of chunks) {
+        const messageMap = new Map(client.getAllMessages().map(m => [m.id, m]));
+        const items = ids.map(id => ({
+          id,
+          labels: (messageMap.get(id)?.labels || []).slice()
+        }));
+
+        await client.batchModify(ids, action.addLabels || [], action.removeLabels || []);
+        undoLog.push({ kind: 'restoreLabels', items });
+      }
+    } else if (action.kind === 'createFilter') {
+      const res = await client.createFilter(action.filter);
+      undoLog.push({ kind: 'deleteFilter', id: res.id });
+    }
+  }
 }
 
-/**
- * Group expense messages into vendor cards for Docket.
- * Flags missing amounts and near-duplicates per the rule:
- * same vendor + currency, amount within 1 minor unit, within 48 hours,
- * different message id; monthly subscriptions are NOT duplicates.
- */
-export function groupExpenseMessages(messages) {
-  const cards = new Map();
+export async function undoEntries(client, entries) {
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const entry = entries[i];
+
+    if (entry.kind === 'restoreLabels') {
+      await client.restoreLabels(entry.items);
+    } else if (entry.kind === 'deleteFilter') {
+      await client.deleteFilter(entry.id);
+    }
+  }
+}
+
+export function calculateNaiveCalls(affectedCount) {
+  // Naive model: one modify + one filter/label operation per affected email.
+  return Math.max(0, affectedCount) * 2;
+}
+
+export function formatAmountDisplay(amount, currency = 'USD') {
+  if (amount === null || amount === undefined) return '—';
+
+  const curr = String(currency || 'USD').toUpperCase();
+  const sign = amount < 0 ? '-' : '';
+  const abs = Math.abs(Math.round(amount));
+  const major = Math.floor(abs / 100);
+  const minor = String(abs % 100).padStart(2, '0');
+
+  const symbols = {
+    USD: '$',
+    EUR: '€',
+    GBP: '£',
+    INR: '₹',
+    JPY: '¥',
+    CAD: 'C$',
+    AUD: 'A$'
+  };
+
+  const symbol = symbols[curr] || `${curr} `;
+  return `${sign}${symbol}${major}.${minor}`;
+}
+
+export function totalsPerCurrency(messages) {
+  const totals = new Map();
+
   for (const msg of messages) {
-    if (!msg.isExpense || !msg.labels.includes('INBOX')) continue;
-    const vendor = msg.vendor || 'Unknown';
-    const key = `expense|${vendor}`;
-    if (!cards.has(key)) {
-      cards.set(key, {
-        key, vendor,
+    if (msg.amount === null || msg.amount === undefined) continue;
+    const currency = String(msg.currency || 'USD').toUpperCase();
+    totals.set(currency, (totals.get(currency) || 0) + msg.amount);
+  }
+
+  return totals;
+}
+
+export function groupExpenseMessages(expenseMessages) {
+  const byVendor = new Map();
+
+  for (const msg of expenseMessages) {
+    const vendor = String(msg.vendor || msg.name || 'Unknown vendor').trim() || 'Unknown vendor';
+    const key = vendor.toLowerCase();
+
+    if (!byVendor.has(key)) {
+      byVendor.set(key, {
+        key,
+        vendor,
         category: msg.category || 'other',
         messages: [],
-        messageIds: [],
-        amounts: [],
-        currencies: new Set(),
-        dates: [],
+        subjects: [],
+        count: 0,
         hasMissingAmount: false,
         hasNearDuplicate: false
       });
     }
-    const card = cards.get(key);
+
+    const card = byVendor.get(key);
     card.messages.push(msg);
-    card.messageIds.push(msg.id);
-    if (msg.amount !== null) card.amounts.push(msg.amount);
-    card.currencies.add(msg.currency || 'USD');
-    if (msg.date) card.dates.push(msg.date);
-    if (msg.amount === null) card.hasMissingAmount = true;
-  }
+    card.count += 1;
 
-  for (const card of cards.values()) {
-    outer:
-    for (let i = 0; i < card.messages.length; i++) {
-      for (let j = i + 1; j < card.messages.length; j++) {
-        if (isNearDuplicate(card.messages[i], card.messages[j])) {
-          card.hasNearDuplicate = true;
-          break outer;
-        }
-      }
+    if (msg.amount === null || msg.amount === undefined) {
+      card.hasMissingAmount = true;
+    }
+
+    if (card.subjects.length < 8 && msg.subject) {
+      card.subjects.push(msg.subject);
+    }
+
+    if (msg.category && !card.category) {
+      card.category = msg.category;
     }
   }
 
-  const result = [];
-  for (const card of cards.values()) {
-    const sortedAmounts = [...card.amounts].sort((a, b) => a - b);
-    const dates = [...card.dates].sort();
-    result.push({
-      key: card.key,
-      vendor: card.vendor,
-      category: card.category,
-      count: card.messages.length,
-      subjects: [...new Set(card.messages.map(m => m.subject))].slice(0, 3),
-      dateRange: dates.length ? `${dates[0]} to ${dates[dates.length - 1]}` : '',
-      displayAmount: sortedAmounts.length ? sortedAmounts[Math.floor(sortedAmounts.length / 2)] : null,
-      displayCurrency: card.currencies.values().next().value || 'USD',
-      hasMissingAmount: card.hasMissingAmount,
-      hasNearDuplicate: card.hasNearDuplicate,
-      messageIds: card.messageIds,
-      messages: card.messages
-    });
-  }
-  result.sort((a, b) => b.count - a.count);
-  return result;
-}
+  const cards = Array.from(byVendor.values()).map(card => {
+    const currencyCounts = new Map();
+    const currencyTotals = new Map();
 
-/**
- * Flush actions through the client in batches of at most 1000 IDs.
- * Every batchModify batch and every filter creation is recorded in the
- * undo log in order, together with the exact pre-batch label arrays so
- * undo can restore the inbox exactly (including label order).
- */
-export async function flushActions(client, actions, undoLog) {
-  const results = [];
-  for (const action of actions) {
-    if (action.type === 'batchModify') {
-      for (let i = 0; i < action.ids.length; i += 1000) {
-        const batch = action.ids.slice(i, i + 1000);
-        const prevLabels = new Map();
-        for (const id of batch) {
-          const m = client.getMessage ? client.getMessage(id) : null;
-          if (m) prevLabels.set(id, [...m.labels]);
-        }
-        await client.batchModify({
-          ids: batch,
-          addLabelIds: action.addLabelIds,
-          removeLabelIds: action.removeLabelIds
-        });
-        undoLog.push({
-          type: 'batchModify',
-          ids: batch,
-          addLabelIds: action.addLabelIds,
-          removeLabelIds: action.removeLabelIds,
-          prevLabels,
-          timestamp: Date.now()
-        });
-      }
-    } else if (action.type === 'createFilter') {
-      const { id } = await client.createFilter(action.criteria, action.action);
-      undoLog.push({ type: 'createFilter', filterId: id, timestamp: Date.now() });
-      results.push({ filterId: id });
-    }
-  }
-  return results;
-}
-
-/**
- * Undo a list of flushed entries in reverse order.
- * batchModify entries restore the exact pre-batch label arrays (which
- * re-adds INBOX and removes added labels in one step); filters are deleted.
- */
-export async function undoEntries(client, entries) {
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i];
-    if (e.type === 'batchModify') {
-      if (e.prevLabels && client.restoreLabels) {
-        client.restoreLabels(e.prevLabels);
-      } else {
-        await client.batchModify({
-          ids: e.ids,
-          addLabelIds: e.removeLabelIds,
-          removeLabelIds: e.addLabelIds
-        });
-      }
-    } else if (e.type === 'createFilter') {
-      await client.deleteFilter(e.filterId);
-    }
-  }
-  return entries.length;
-}
-
-/**
- * Undo: revert flushed entries in reverse order.
- * all=true reverts every flushed entry; otherwise only the most recent.
- * Returns how many entries were reverted.
- */
-export async function undoLast(client, undoLog, all = false) {
-  const entries = all ? undoLog.splice(0) : undoLog.splice(undoLog.length - 1);
-  return undoEntries(client, entries);
-}
-
-export function calculateNaiveCalls(affectedMessages) {
-  return 2 * affectedMessages;
-}
-
-const SYMBOLS = { USD: '$', EUR: '\u20AC', GBP: '\u00A3', INR: '\u20B9', CAD: 'C$', AUD: 'A$' };
-
-export function formatAmountDisplay(minorUnits, currency) {
-  if (minorUnits === null || minorUnits === undefined) return '—';
-  const major = minorUnits / 100;
-  const formatted = major.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  return (SYMBOLS[currency] || currency + ' ') + formatted;
-}
-
-/**
- * CSV export for Docket.
- * Header exactly: vendor,date,amount,currency,category,verdict,messageId
- * One row per reviewed expense message (approved and review alike),
- * amounts as integer minor units.
- * Escapes commas/quotes/newlines and neutralizes formula injection
- * (=, +, -, @ prefixes get a leading apostrophe).
- */
-export function generateExpenseCSV(expenseCards, verdicts) {
-  const rows = ['vendor,date,amount,currency,category,verdict,messageId'];
-  for (const card of expenseCards) {
-    const verdict = verdicts[card.key] || 'Review';
     for (const msg of card.messages) {
-      const fields = [
-        msg.vendor || '',
-        msg.date ? msg.date.split('T')[0] : '',
-        msg.amount !== null && msg.amount !== undefined ? String(msg.amount) : '',
-        msg.currency || '',
-        msg.category || '',
-        verdict,
-        msg.id
-      ].map(escapeCsvField);
-      rows.push(fields.join(','));
+      if (msg.amount === null || msg.amount === undefined) continue;
+      const curr = String(msg.currency || 'USD').toUpperCase();
+      currencyCounts.set(curr, (currencyCounts.get(curr) || 0) + 1);
+      currencyTotals.set(curr, (currencyTotals.get(curr) || 0) + msg.amount);
+    }
+
+    const displayCurrency =
+      Array.from(currencyCounts.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] || 'USD';
+
+    const displayAmount = currencyTotals.get(displayCurrency) ?? null;
+
+    const fingerprintCounts = new Map();
+    for (const msg of card.messages) {
+      if (msg.amount === null || msg.amount === undefined) continue;
+      const fp = [
+        msg.amount,
+        String(msg.currency || 'USD').toUpperCase(),
+        String(msg.date || '').slice(0, 10),
+        msg.category || 'other'
+      ].join('|');
+      fingerprintCounts.set(fp, (fingerprintCounts.get(fp) || 0) + 1);
+    }
+
+    const hasNearDuplicate = Array.from(fingerprintCounts.values()).some(n => n > 1);
+
+    const subjectCounts = new Map();
+    for (const s of card.subjects) {
+      subjectCounts.set(s, (subjectCounts.get(s) || 0) + 1);
+    }
+
+    const topSubjects = Array.from(subjectCounts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .map(([s]) => s)
+      .slice(0, 3);
+
+    return {
+      ...card,
+      subjects: topSubjects,
+      displayAmount,
+      displayCurrency,
+      dateRange: formatDateRange(card.messages),
+      hasNearDuplicate
+    };
+  });
+
+  cards.sort((a, b) => b.count - a.count || a.vendor.localeCompare(b.vendor));
+  return cards;
+}
+
+export function generateExpenseCSV(cards, verdicts) {
+  const header = 'vendor,date,amount,currency,category,verdict,messageId';
+  const rows = [header];
+
+  for (const card of cards) {
+    const verdict = verdicts[card.key];
+    if (!verdict) continue;
+
+    for (const msg of card.messages) {
+      const amount =
+        msg.amount === null || msg.amount === undefined
+          ? ''
+          : (msg.amount / 100).toFixed(2);
+
+      const date = msg.date ? new Date(msg.date).toISOString().slice(0, 10) : '';
+      const currency = String(msg.currency || card.displayCurrency || 'USD').toUpperCase();
+      const category = msg.category || card.category || 'other';
+
+      rows.push([
+        escapeCsv(card.vendor),
+        escapeCsv(date),
+        escapeCsv(amount),
+        escapeCsv(currency),
+        escapeCsv(category),
+        escapeCsv(verdict),
+        escapeCsv(msg.id)
+      ].join(','));
     }
   }
+
   return rows.join('\n');
 }
 
-function escapeCsvField(field) {
-  let s = String(field ?? '');
-  if (/^[=+\-@]/.test(s)) s = "'" + s;
-  if (/[",\n\r]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
-  return s;
-}
-
-/**
- * Sum approved expense amounts per currency. Never sums across currencies.
- */
-export function totalsPerCurrency(messages) {
-  const totals = new Map();
-  for (const m of messages) {
-    if (m.amount === null || m.amount === undefined) continue;
-    const c = m.currency || 'USD';
-    totals.set(c, (totals.get(c) || 0) + m.amount);
-  }
-  return totals;
-}
-
-/**
- * Per-currency totals of APPROVED expense cards only (Review cards excluded).
- * Kept here rather than inline in the UI so it is directly testable.
- */
-export function approvedTotals(expenseCards, verdicts) {
-  const messages = [];
-  for (const card of expenseCards) {
-    if (verdicts[card.key] === 'Approve') messages.push(...card.messages);
-  }
-  return totalsPerCurrency(messages);
-}
+export const __internals = {
+  KNOWN_SYSTEM_LABELS,
+  GENERIC_LOCALS,
+  SAFETY_WORDS
+};
