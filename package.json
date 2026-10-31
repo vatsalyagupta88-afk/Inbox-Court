@@ -1,0 +1,12 @@
+{
+  "name": "inbox-court",
+  "version": "1.0.0",
+  "description": "Inbox Court - a static browser app for Gmail cleanup via swipe game",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
